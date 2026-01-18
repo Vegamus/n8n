@@ -8,6 +8,8 @@ import type { INodeTypeDescription } from 'n8n-workflow';
 
 import { LLMServiceError } from '@/errors';
 import { buildBuilderPrompt } from '@/prompts/agents/builder.prompt';
+import { autoFixConnections } from '@/validation/auto-fix';
+import { validateConnections } from '@/validation/checks';
 import type { BuilderFeatureFlags, ChatPayload } from '@/workflow-builder-agent';
 
 import { BaseSubgraph } from './subgraph-interface';
@@ -104,7 +106,11 @@ export class BuilderSubgraph extends BaseSubgraph<
 	name = 'builder_subgraph';
 	description = 'Constructs workflow structure: creating nodes and connections';
 
+	private config?: BuilderSubgraphConfig;
+
 	create(config: BuilderSubgraphConfig) {
+		// Store config for use in transformOutput
+		this.config = config;
 		// Check if template examples are enabled
 		const includeExamples = config.featureFlags?.templateExamples === true;
 
@@ -227,8 +233,37 @@ export class BuilderSubgraph extends BaseSubgraph<
 		subgraphOutput: typeof BuilderSubgraphState.State,
 		_parentState: typeof ParentGraphState.State,
 	) {
-		const nodes = subgraphOutput.workflowJSON.nodes;
-		const connections = subgraphOutput.workflowJSON.connections;
+		let workflowJSON = subgraphOutput.workflowJSON;
+		let autoFixSummary: string | undefined;
+
+		// Auto-fix missing AI connections before returning to parent
+		if (this.config?.parsedNodeTypes) {
+			const violations = validateConnections(workflowJSON, this.config.parsedNodeTypes);
+			const fixableViolations = violations.filter(
+				(v) => v.name === 'node-missing-required-input' || v.name === 'sub-node-not-connected',
+			);
+
+			if (fixableViolations.length > 0) {
+				const autoFixResult = autoFixConnections(
+					workflowJSON,
+					this.config.parsedNodeTypes,
+					fixableViolations,
+				);
+
+				if (autoFixResult.fixed.length > 0) {
+					workflowJSON = {
+						...workflowJSON,
+						connections: autoFixResult.updatedConnections,
+					};
+					autoFixSummary = `Auto-fixed ${autoFixResult.fixed.length} connection(s): ${autoFixResult.fixed
+						.map((fix) => `${fix.sourceNodeName} → ${fix.targetNodeName}`)
+						.join(', ')}`;
+				}
+			}
+		}
+
+		const nodes = workflowJSON.nodes;
+		const connections = workflowJSON.connections;
 		const connectionCount = Object.values(connections).flat().length;
 
 		// Extract builder's actual summary (last message without tool calls)
@@ -247,11 +282,15 @@ export class BuilderSubgraph extends BaseSubgraph<
 			typeof builderSummary?.content === 'string' ? builderSummary.content : undefined;
 
 		// Create coordination log entry (not a message)
+		const summary = autoFixSummary
+			? `Created ${nodes.length} nodes with ${connectionCount} connections. ${autoFixSummary}`
+			: `Created ${nodes.length} nodes with ${connectionCount} connections`;
+
 		const logEntry: CoordinationLogEntry = {
 			phase: 'builder',
 			status: 'completed',
 			timestamp: Date.now(),
-			summary: `Created ${nodes.length} nodes with ${connectionCount} connections`,
+			summary,
 			output: summaryText,
 			metadata: createBuilderMetadata({
 				nodesCreated: nodes.length,
@@ -261,7 +300,7 @@ export class BuilderSubgraph extends BaseSubgraph<
 		};
 
 		return {
-			workflowJSON: subgraphOutput.workflowJSON,
+			workflowJSON,
 			workflowOperations: subgraphOutput.workflowOperations ?? [],
 			coordinationLog: [logEntry],
 			cachedTemplates: subgraphOutput.cachedTemplates,
